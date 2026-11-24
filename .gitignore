@@ -218,3 +218,10 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
+
+.DS_Store
+
+# Large raw datasets (exceeds GitHub 100MB limit)
+data/sec_13f_*/
+*.tsv
+
