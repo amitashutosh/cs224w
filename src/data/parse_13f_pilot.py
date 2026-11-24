@@ -54,6 +54,16 @@ SEC_HEADERS = {
     "Connection": "keep-alive",
 }
 
+# Regex patterns identifying passive index replicators to isolate active institutional management
+PASSIVE_MANAGER_NAME_PATTERNS = [
+    r"VANGUARD",
+    r"BLACKROCK",
+    r"STATE\s+STREET",
+    r"SSGA",
+    r"GEODE\s+CAPITAL",
+    r"NORTHERN\s+TRUST",
+]
+
 SSL_CONTEXT = ssl.create_default_context()
 SSL_CONTEXT.check_hostname = False
 SSL_CONTEXT.verify_mode = ssl.CERT_NONE
@@ -171,7 +181,7 @@ def get_sec_ticker_mapping(tickers: list) -> pd.DataFrame:
 
 
 def load_submission_table(sub_path: str) -> pd.DataFrame:
-    """Reads SUBMISSION.tsv adapting to different column names across quarterly dumps."""
+    """Reads SUBMISSION.tsv and attaches MANAGER_NAME from COVERPAGE.tsv if available."""
     sample_sub = pd.read_csv(sub_path, sep="\t", nrows=5)
     cols = sample_sub.columns.tolist()
     
@@ -194,6 +204,21 @@ def load_submission_table(sub_path: str) -> pd.DataFrame:
     if name_col:
         rename_dict[name_col] = "MANAGER_NAME"
     df_sub = df_sub.rename(columns=rename_dict)
+
+    # If MANAGER_NAME is not in SUBMISSION.tsv, extract from COVERPAGE.tsv
+    if "MANAGER_NAME" not in df_sub.columns:
+        cover_path = os.path.join(os.path.dirname(sub_path), "COVERPAGE.tsv")
+        if os.path.exists(cover_path):
+            sample_cp = pd.read_csv(cover_path, sep="\t", nrows=5)
+            cp_cols = sample_cp.columns.tolist()
+            cp_acc = next((c for c in cp_cols if "ACCESSION" in c.upper()), None)
+            cp_name = next((c for c in cp_cols if any(k in c.upper() for k in ["FILINGMANAGER_NAME", "MANAGER", "NAME"])), None)
+            if cp_acc and cp_name:
+                print(f"Attaching manager names from {os.path.basename(cover_path)} using column: {cp_name}")
+                df_cp = pd.read_csv(cover_path, sep="\t", usecols=[cp_acc, cp_name], dtype=str, low_memory=False)
+                df_cp = df_cp.rename(columns={cp_acc: "ACCESSION_NUMBER", cp_name: "MANAGER_NAME"})
+                df_sub = df_sub.merge(df_cp, on="ACCESSION_NUMBER", how="left")
+
     return df_sub
 
 
@@ -277,10 +302,22 @@ def build_ownership_overlap_graph():
 
     print(f"Matched {len(df_info)} equity holding records for S&P 500 universe.")
 
-    # 3. Merge with SUBMISSION to attach institutional CIKs
-    df_merged = df_info.merge(df_sub[["ACCESSION_NUMBER", "CIK"]], on="ACCESSION_NUMBER", how="inner")
+    # 3. Merge with SUBMISSION to attach institutional CIKs and manager names
+    merge_sub_cols = ["ACCESSION_NUMBER", "CIK"]
+    if "MANAGER_NAME" in df_sub.columns:
+        merge_sub_cols.append("MANAGER_NAME")
+    df_merged = df_info.merge(df_sub[merge_sub_cols], on="ACCESSION_NUMBER", how="inner")
 
-    # 4. Filter passive index noise: positions with value >= $1M (13F VALUE is in thousands)
+    # 4. Filter passive index noise:
+    # 4a. Exclude mega-cap passive indexers (Vanguard, BlackRock, SSGA, Geode, Northern Trust)
+    if "MANAGER_NAME" in df_merged.columns:
+        passive_regex = "|".join(PASSIVE_MANAGER_NAME_PATTERNS)
+        is_passive = df_merged["MANAGER_NAME"].str.upper().str.contains(passive_regex, regex=True, na=False)
+        passive_count = int(is_passive.sum())
+        print(f"Filtered {passive_count} passive records matching Vanguard, BlackRock, State Street/SSGA, Geode, Northern Trust.")
+        df_merged = df_merged[~is_passive].copy()
+
+    # 4b. Filter micro-positions: positions with value >= $1M (13F VALUE is in thousands)
     df_active = df_merged[df_merged["VALUE"] >= 1000.0].copy()
     if len(df_active) < 1000:
         # Fallback if values are reported in single dollars rather than thousands

@@ -44,35 +44,35 @@ class MultiheadDiffAttn(nn.Module):
         self.lambda_q2 = nn.Parameter(torch.zeros(self.head_dim))
         self.lambda_k2 = nn.Parameter(torch.zeros(self.head_dim))
 
-    def _build_prior_tensor(
+    def _normalize_adj_prior(
         self,
-        adj_priors: Union[torch.Tensor, List[Optional[torch.Tensor]], Dict[int, torch.Tensor], None],
+        adj_prior: Union[torch.Tensor, List[Optional[torch.Tensor]], Dict[int, torch.Tensor], None],
         x: torch.Tensor,
         num_nodes: int,
     ) -> Optional[torch.Tensor]:
         """Constructs or formats a (1, num_heads, N, N) prior modulation tensor."""
-        if adj_priors is None:
+        if adj_prior is None:
             return None
 
         # Case 1: Sequence / list of priors per head, e.g. [A_global, A_own]
-        if isinstance(adj_priors, (list, tuple)):
+        if isinstance(adj_prior, (list, tuple)):
             prior = x.new_ones(1, self.num_heads, num_nodes, num_nodes)
-            for h_idx, p in enumerate(adj_priors):
+            for h_idx, p in enumerate(adj_prior):
                 if h_idx < self.num_heads and p is not None:
                     prior[0, h_idx] = p.to(device=x.device, dtype=x.dtype)
             return prior
 
         # Case 2: Dictionary mapping head index to prior tensor, e.g. {0: A_global, 1: A_own}
-        if isinstance(adj_priors, dict):
+        if isinstance(adj_prior, dict):
             prior = x.new_ones(1, self.num_heads, num_nodes, num_nodes)
-            for h_idx, p in adj_priors.items():
+            for h_idx, p in adj_prior.items():
                 if h_idx < self.num_heads and p is not None:
                     prior[0, h_idx] = p.to(device=x.device, dtype=x.dtype)
             return prior
 
         # Case 3: PyTorch Tensor
-        if isinstance(adj_priors, torch.Tensor):
-            p = adj_priors.to(device=x.device, dtype=x.dtype)
+        if isinstance(adj_prior, torch.Tensor):
+            p = adj_prior.to(device=x.device, dtype=x.dtype)
             if p.dim() == 2:
                 # (N, N) -> broadcast to (1, 1, N, N) across all heads
                 return p.unsqueeze(0).unsqueeze(0)
@@ -89,11 +89,11 @@ class MultiheadDiffAttn(nn.Module):
     def forward(
         self,
         x: torch.Tensor,
-        adj_priors: Union[torch.Tensor, List[Optional[torch.Tensor]], Dict[int, torch.Tensor], None] = None,
+        adj_prior: Union[torch.Tensor, List[Optional[torch.Tensor]], Dict[int, torch.Tensor], None] = None,
     ) -> torch.Tensor:
         """
         x: (B, N, d)
-        adj_priors: Prior tensor(s) modulating spatial attention.
+        adj_prior: Prior tensor(s) modulating spatial attention.
         """
         B, N, d = x.shape
 
@@ -118,7 +118,7 @@ class MultiheadDiffAttn(nn.Module):
         attn_map2 = F.softmax(attn_scores2, dim=-1)
 
         # Modulate attention maps by topological graph prior(s)
-        prior_tensor = self._build_prior_tensor(adj_priors, x, N)
+        prior_tensor = self._normalize_adj_prior(adj_prior, x, N)
         if prior_tensor is not None:
             attn_map1 = attn_map1 * prior_tensor
 
@@ -155,11 +155,13 @@ class DifferentialGraphTransformer(nn.Module):
         embed_dim: int = 64,
         num_heads: int = 4,
         dropout: float = 0.1,
+        lambda_init: float = 0.8,
     ):
         super().__init__()
         self.num_stocks = num_stocks
         self.window_size = window_size
         self.embed_dim = embed_dim
+        self.lambda_init = lambda_init
 
         # Project scalar normalized price at each day into hidden embedding
         self.input_proj = nn.Linear(1, embed_dim)
@@ -178,7 +180,9 @@ class DifferentialGraphTransformer(nn.Module):
         )
 
         # Spatial Differential Graph Attention layer
-        self.spatial_diff_attn = MultiheadDiffAttn(embed_dim, num_heads=num_heads)
+        self.spatial_diff_attn = MultiheadDiffAttn(
+            embed_dim, num_heads=num_heads, lambda_init=lambda_init
+        )
         self.norm = nn.LayerNorm(embed_dim)
 
         # Prediction Head: projects updated stock features to next-day scalar price
@@ -191,11 +195,13 @@ class DifferentialGraphTransformer(nn.Module):
     def forward(
         self,
         x: torch.Tensor,
-        adj_priors: Union[torch.Tensor, List[Optional[torch.Tensor]], Dict[int, torch.Tensor], None] = None,
+        adj_prior: Union[torch.Tensor, List[Optional[torch.Tensor]], Dict[int, torch.Tensor], None] = None,
+        use_spatial: bool = True,
     ) -> torch.Tensor:
         """
         x: (B, T, N) = (Batch, 64, num_stocks)
-        adj_priors: Single prior (N, N), or list/dict of priors per head, e.g. [A_global, A_own]
+        adj_prior: Single prior (N, N), or list/dict of priors per head, e.g. {0: A_global, 1: A_own}
+        use_spatial: If False, bypasses spatial_diff_attn for the Temporal-Only Control arm.
         Returns:
           y_pred: (B, N)
         """
@@ -212,9 +218,13 @@ class DifferentialGraphTransformer(nn.Module):
         # Extract the representation at the final day T (t = 64)
         h_final = h_temp[:, -1, :].view(B, N, self.embed_dim)  # (B, N, d)
 
-        # 3. Spatial Differential Graph Attention across all N stocks conditioned on adj_priors
-        h_spatial = self.spatial_diff_attn(h_final, adj_priors=adj_priors)
-        h_out = self.norm(h_final + h_spatial)  # Residual connection & LayerNorm
+        # 3. Spatial Differential Graph Attention across all N stocks conditioned on adj_prior
+        if use_spatial:
+            h_spatial = self.spatial_diff_attn(h_final, adj_prior=adj_prior)
+            h_out = self.norm(h_final + h_spatial)  # Residual connection & LayerNorm
+        else:
+            # Temporal-Only Control: no spatial cross-stock mixing
+            h_out = self.norm(h_final)
 
         # 4. Project to predicted next-day price: (B, N, d) -> (B, N, 1) -> (B, N)
         y_pred = self.head(h_out).squeeze(-1)

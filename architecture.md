@@ -134,8 +134,8 @@ classDiagram
         +Parameter lambda_k1
         +Parameter lambda_q2
         +Parameter lambda_k2
-        +_build_prior_tensor(adj_priors, x, num_nodes) Tensor
-        +forward(x: Tensor, adj_priors: Any) Tensor
+        +_normalize_adj_prior(adj_prior) Tensor
+        +forward(x: Tensor, adj_prior: Any) Tensor
     }
     Module <|-- MultiheadDiffAttn
 
@@ -143,13 +143,14 @@ classDiagram
         +int num_stocks
         +int window_size
         +int embed_dim
+        +float lambda_init
         +Linear input_proj
         +Parameter pos_embedding
         +TransformerEncoder temporal_encoder
         +MultiheadDiffAttn spatial_diff_attn
         +LayerNorm norm
         +Sequential head
-        +forward(x: Tensor, adj_priors: Any) Tensor
+        +forward(x: Tensor, adj_prior: Any, use_spatial: bool) Tensor
     }
     Module <|-- DifferentialGraphTransformer
     DifferentialGraphTransformer *-- MultiheadDiffAttn : contains
@@ -215,8 +216,8 @@ flowchart TD
     subgraph Stage2 ["STAGE 2: Institutional Ownership Graph Construction (parse_13f_pilot.py)"]
         direction TB
         sec_raw["SEC Form 13F Bulk TSVs (Q1 2024)<br/>INFOTABLE.tsv & SUBMISSION.tsv<br/>851,250 equity records"]
-        sec_filter["Filter & Align to 472 Tickers<br/>Threshold: Position Value ≥ $1M"]
-        binary_m["Bipartite Binary Ownership Matrix M<br/>Shape: (6,377 managers, 472 stocks)"]
+        sec_filter["Filter & Align to 472 Tickers<br/>1. Exclude Passive Indexers (Vanguard, BlackRock, SSGA, Geode, Northern Trust)<br/>2. Position Value Floor ≥ $1M"]
+        binary_m["Bipartite Binary Ownership Matrix M<br/>Shape: (6,370 managers, 472 stocks)"]
 
         a_own["Jaccard Co-Holding Overlap Prior A_own<br/>A_ij = |M_i ∩ M_j| / |M_i ∪ M_j|<br/>Shape: (472, 472) | Density: 88.04%<br/>★ Prior Topology for Head 2 ★"]
 
@@ -237,15 +238,15 @@ flowchart TD
         %% Temporal Encoding
         input_x["Input Price Sequence Batch X_t<br/>Shape: (B=32, T=64, N=472)"]
         input_proj["1. Linear Projection + Positional Embedding<br/>(B, 64, 472, 1) → (B, 64, 472, d=64)"]
-        temp_attn["2. Temporal Transformer Encoder<br/>Reshape: (B*N, 64, d)<br/>Causal Self-Attention across 64-day lookback"]
+        temp_attn["2. Temporal Transformer Encoder<br/>Reshape: (B*N, 64, d)<br/>Causal Mask (generate_square_subsequent_mask)"]
         h_final["Final Lookback State Slice (t = 64)<br/>h_final: (B=32, N=472, d=64)"]
 
         %% Multi-Head Spatial Differential Attention
         subgraph MultiHead ["3. MultiheadDiffAttn (Spatial Relational Conditioning)"]
             direction TB
-            head1["Head 1: DiffAttn₁ ⊙ A_global<br/>(Macro Correlation Structure)"]
-            head2["Head 2: DiffAttn₂ ⊙ A_own<br/>(Institutional Co-Holding Structure)"]
-            heads_rest["Heads 3 & 4: Unconstrained DiffAttn<br/>(Latent High-Order Interactions)"]
+            head1["Head 1 (Idx 0): DiffAttn₁ ⊙ A_global<br/>(Macro Correlation Structure)"]
+            head2["Head 2 (Idx 1): DiffAttn₂ ⊙ A_own<br/>(Institutional Co-Holding Structure)"]
+            heads_rest["Heads 3 & 4 (Idx 2,3): Unconstrained DiffAttn<br/>(Latent High-Order Interactions)"]
 
             diff_combine["Differential Subtraction & Value Aggregation<br/>DiffAttn = Attn_map1 - λ · Attn_map2<br/>out: (B, 472, d=64)"]
 
@@ -292,7 +293,7 @@ erDiagram
 
     INSTITUTIONAL_MANAGER {
         string CIK PK
-        string FILING_MANAGER_NAME
+        string MANAGER_NAME
     }
 
     SUBMISSION {
@@ -349,5 +350,5 @@ erDiagram
 | Step       | Script                                                                        | Input Files / Sources                                     | Core Function / Class                                  | Output Produced                                   | Verified Dimensions                                                       |
 | :--------- | :---------------------------------------------------------------------------- | :-------------------------------------------------------- | :----------------------------------------------------- | :------------------------------------------------ | :------------------------------------------------------------------------ |
 | **Step 1** | [price_loader.py](src/data/price_loader.py)                                   | `data/sp500.csv`                                          | `SP500PricePipeline`                                   | Train/Val/Test DataLoaders + $A^{\text{global}}$  | $X: [32, 64, 472]$<br/>$y: [32, 472]$<br/>$A^{\text{global}}: [472, 472]$ |
-| **Step 2** | [parse_13f_pilot.py](src/data/parse_13f_pilot.py)                             | SEC EDGAR Q1 bulk TSVs, `company_tickers.json`            | `build_ownership_overlap_graph()`                      | `data/A_own_pilot.pt` (Jaccard similarity matrix) | $A^{\text{own}}: [472, 472]$<br/>Density: $88.04\%$                       |
-| **Step 3** | [dgt.py](src/models/dgt.py)<br/>[forward_test.py](src/models/forward_test.py) | Step 1 DataLoaders, $A^{\text{global}}$, $A^{\text{own}}$ | `DifferentialGraphTransformer`<br/>`MultiheadDiffAttn` | End-to-end forward/backward gradient check        | Forward $\hat{y}: [32, 472]$<br/>Backward MSE loss: $0.8933$              |
+| **Step 2** | [parse_13f_pilot.py](src/data/parse_13f_pilot.py)                             | SEC EDGAR Q1 bulk TSVs, `company_tickers.json`            | `build_ownership_overlap_graph()`                      | `data/A_own_pilot.pt` (Jaccard similarity matrix) | $A^{\text{own}}: [472, 472]$<br/>Active Managers: $6,370$<br/>Density: $88.04\%$ |
+| **Step 3** | [dgt.py](src/models/dgt.py)<br/>[forward_test.py](src/models/forward_test.py) | Step 1 DataLoaders, $A^{\text{global}}$, $A^{\text{own}}$ | `DifferentialGraphTransformer`<br/>`MultiheadDiffAttn` | End-to-end forward/backward gradient check        | Forward $\hat{y}: [32, 472]$<br/>Combined-prior $\hat{y}: [32, 472]$<br/>Backward MSE loss: $1.1222$ (`seed=42`) |

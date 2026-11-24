@@ -38,7 +38,7 @@ This framework implements the **Differential Graph Transformer (DGT)** (adapted 
 
 1. **Dual-Prior Relational Topology:**
    - **Head 1: Macro Pearson Correlation Prior ($A^{\text{global}} \in \mathbb{R}^{472 \times 472}$):** Derived strictly from in-sample historical price correlations across 2,517 trading days.
-   - **Head 2: Institutional Co-Holding Prior ($A^{\text{own}} \in \mathbb{R}^{472 \times 472}$):** Derived from quarterly SEC Form 13F institutional holdings across 6,377 managers, measuring institutional co-investment via Jaccard similarity.
+   - **Head 2: Institutional Co-Holding Prior ($A^{\text{own}} \in \mathbb{R}^{472 \times 472}$):** Derived from quarterly SEC Form 13F institutional holdings across 6,370 active managers (excluding passive indexers), measuring institutional co-investment via Jaccard similarity.
    - **Heads 3 & 4: Data-Driven Latent Interactions:** Unconstrained differential attention heads that learn dynamic spatial affinities directly from data.
 
 2. **Noise-Canceling Differential Graph Attention:**
@@ -62,7 +62,7 @@ flowchart LR
     end
 
     subgraph S2 ["Stage 2: 13F Ownership Graph"]
-        SEC["SEC Form 13F Bulk TSVs<br/>(851,250 holdings)"] --> Bip["Bipartite Manager Matrix<br/>(6,377 × 472)"]
+        SEC["SEC Form 13F Bulk TSVs<br/>(851,250 holdings)"] --> Bip["Bipartite Manager Matrix<br/>(6,370 × 472)"]
         Bip --> AO["Jaccard Overlap Prior<br/>A_own: (472, 472)"]
     end
 
@@ -169,9 +169,9 @@ uv run python src/data/parse_13f_pilot.py
 
 - **Actions performed:**
   1. Discovers and downloads the SEC EDGAR Form 13F Q1 2024 bulk data archive (`01mar2024-31may2024_form13f.zip`) and company ticker directory.
-  2. Parses `SUBMISSION.tsv` and `INFOTABLE.tsv`, filtering records down to the 472 S&P 500 constituent tickers.
-  3. Filters passive micro-positions ($< \$1\text{M}$ market value) to isolate active institutional management.
-  4. Constructs the bipartite manager-stock ownership matrix across 6,377 managers and 851,250 equity records.
+  2. Parses `SUBMISSION.tsv`, `COVERPAGE.tsv`, and `INFOTABLE.tsv`, filtering records down to the 472 S&P 500 constituent tickers.
+  3. Filters passive index noise: excludes mega passive indexers (Vanguard, BlackRock, SSGA, Geode, Northern Trust) and micro-positions ($< \$1\text{M}$ market value) to isolate active institutional management.
+  4. Constructs the bipartite manager-stock ownership matrix across 6,370 active managers and 851,250 equity records.
   5. Computes the Jaccard similarity matrix $A^{\text{own}} \in \mathbb{R}^{472 \times 472}$ with diagonal self-loops ($A_{ii} = 1.0$).
   6. Serializes the resulting tensor to `data/A_own_pilot.pt`.
 
@@ -184,6 +184,12 @@ Run [src/models/forward_test.py](src/models/forward_test.py):
 ```bash
 uv run python src/models/forward_test.py
 ```
+
+- **Reproducibility & Seeding:** `forward_test.py` is **seeded by default (`seed=42`)** for deterministic verification against the metrics below. To avoid seed hacking during training or to stress-test the smoke check across arbitrary initializations, disable seeding or pass custom seeds:
+  ```bash
+  uv run python src/models/forward_test.py --unseeded    # Non-deterministic smoke test
+  uv run python src/models/forward_test.py --seed 123    # Custom seed for multi-seed evaluation
+  ```
 
 - **Actions performed:**
   1. Loads a live mini-batch of prices ($X \in \mathbb{R}^{32 \times 64 \times 472}$, $y \in \mathbb{R}^{32 \times 472}$) from `price_loader.py`.
@@ -209,7 +215,7 @@ When running the pipeline verification (`src/models/forward_test.py`), confirm y
 | **Temporal Transformer State** | `h_final` | `(32, 472, 64)` | Final hidden state across lookback ($d=64$) |
 | **Differential Spatial Map** | `diff_attn` | `(32, 4, 472, 472)` | `(Batch, Heads=4, N=472, N=472)` |
 | **Model Forecast Output** | `y_hat` | `(32, 472)` | Predicted standardized price vector |
-| **Verification Loss & Gradients** | `loss` | `~ 0.8933` | Initial sanity MSE loss; valid gradients on all parameters |
+| **Verification Loss & Gradients** | `loss` | `1.1222` | Initial sanity MSE loss (`seed=42`); valid gradients on all parameters |
 
 ### Sample Institutional Overlap Sub-Matrix ($A^{\text{own}}$)
 
@@ -217,11 +223,11 @@ The pilot parsing of SEC Form 13F Q1 2024 institutional co-holdings yields the f
 
 | Ticker | AAPL | MSFT | NVDA | AMZN | META |
 | :--- | :---: | :---: | :---: | :---: | :---: |
-| **AAPL** | **1.000** | 0.792 | 0.701 | 0.754 | 0.634 |
-| **MSFT** | 0.792 | **1.000** | 0.746 | 0.811 | 0.676 |
-| **NVDA** | 0.701 | 0.746 | **1.000** | 0.764 | 0.709 |
-| **AMZN** | 0.754 | 0.811 | 0.764 | **1.000** | 0.710 |
-| **META** | 0.634 | 0.676 | 0.709 | 0.710 | **1.000** |
+| **AAPL** | **1.000** | 0.792 | 0.700 | 0.754 | 0.633 |
+| **MSFT** | 0.792 | **1.000** | 0.746 | 0.811 | 0.675 |
+| **NVDA** | 0.700 | 0.746 | **1.000** | 0.764 | 0.709 |
+| **AMZN** | 0.754 | 0.811 | 0.764 | **1.000** | 0.709 |
+| **META** | 0.633 | 0.675 | 0.709 | 0.709 | **1.000** |
 
 ---
 
@@ -233,7 +239,7 @@ Standard financial time series must be structured into causal input-target pairs
 
 $$X_t = [P_{t-63}, P_{t-62}, \dots, P_t] \in \mathbb{R}^{64 \times N}, \quad y_t = P_{t+1} \in \mathbb{R}^{N}$$
 
-A window of 64 trading days corresponds to approximately one full financial quarter (~63–64 trading days). This allows the internal causal temporal transformer to capture quarterly trend persistence, momentum, and mean-reversion signals rather than relying solely on high-noise 1-day lags.
+A window of 64 trading days corresponds to approximately one full financial quarter (~63–64 trading days). This allows the internal temporal transformer to capture quarterly trend persistence, momentum, and mean-reversion signals rather than relying solely on high-noise 1-day lags. The temporal encoder explicitly enforces causality across this lookback window using an upper-triangular attention mask (`nn.Transformer.generate_square_subsequent_mask(T)`), ensuring that any day $\tau \in [1, 64]$ attends strictly to historical trading days $\tau' \le \tau$ with zero forward sequence leakage.
 
 ### 2. Multi-Head Differential Spatial Graph Attention
 
@@ -248,6 +254,8 @@ $$\lambda = \exp(\lambda_{q1} \cdot \lambda_{k1}) - \exp(\lambda_{q2} \cdot \lam
 - **Head 1:** Ingests $A^{\text{global}}$, modulating spatial attention by long-term macro co-movements.
 - **Head 2:** Ingests $A^{\text{own}}$, modulating spatial attention by common institutional ownership and capital allocation.
 - **Heads 3 & 4:** Operate without static prior masks ($A = \mathbf{1}_{N \times N}$), enabling the model to learn dynamic, latent cross-stock interactions.
+
+*(Note on Indexing: Heads are 1-indexed in mathematical documentation [Heads 1–4] and 0-indexed in PyTorch code [Heads 0–3], configured via `adj_priors=[A_global, A_own]` or `{0: A_global, 1: A_own}`).*
 
 ### 3. Resolution of PyG-Temporal Compatibility Issues
 
@@ -393,11 +401,13 @@ uv add --dev pytest black ruff
 
 ## References
 
-1. **Differential Transformer:**
+1. **Differential Graph Transformer (DGT):**
+   Li, X., & Pourbabaee, F. (2025). *Stock Market Forecasting with Differential Graph Transformer*. Stanford CS224W Medium Publication. [Read on Medium](https://medium.com/stanford-cs224w/stock-market-forecasting-with-differential-graph-transformer-62d095ebc821).
+2. **Differential Transformer:**
    Ye, T., Dong, L., Gao, Y., Song, Y., & Wei, F. (2024). *Differential Transformer*. arXiv preprint [arXiv:2410.05258](https://arxiv.org/abs/2410.05258).
-2. **Differential Graph Transformer (DGT):**
-   Li, Z., & Pourbabaee, F. (2025). *Differential Graph Transformer for Stock Market Forecasting*.
 3. **SEC EDGAR Form 13F Bulk Data Sets:**
-   U.S. Securities and Exchange Commission, Division of Economic and Risk Analysis (DERA). [SEC Form 13F Data Sets](https://www.sec.gov/data-research/sec-markets-data/form-13f-data-sets).
-4. **Stanford CS224W: Machine Learning with Graphs:**
-   Leskovec, J. (2024). [CS224W Course Homepage](https://web.stanford.edu/class/cs224w/).
+   U.S. Securities and Exchange Commission, Division of Economic and Risk Analysis (DERA) (2024). *Form 13F – Institutional Investment Manager Filings*. [SEC Form 13F Data Sets](https://www.sec.gov/data-research/sec-markets-data/form-13f-data-sets).
+4. **S&P 500 Normalization & Financial Time-Series Setup:**
+   Shi, J., & Hollifield, B. (2024). *Predictive Power of LLMs in Financial Markets*. arXiv preprint [arXiv:2411.16569](https://arxiv.org/abs/2411.16569).
+5. **Stanford CS224W: Machine Learning with Graphs:**
+   Leskovec, J. (2026). [CS224W Course Homepage](https://web.stanford.edu/class/cs224w/).
