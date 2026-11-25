@@ -411,3 +411,4 @@ uv add --dev pytest black ruff
    Shi, J., & Hollifield, B. (2024). *Predictive Power of LLMs in Financial Markets*. arXiv preprint [arXiv:2411.16569](https://arxiv.org/abs/2411.16569).
 5. **Stanford CS224W: Machine Learning with Graphs:**
    Leskovec, J. (2026). [CS224W Course Homepage](https://web.stanford.edu/class/cs224w/).
+
